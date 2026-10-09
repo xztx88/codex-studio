@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build artifacts
+build/
+dist/
+*.app/
+*.dSYM/
+*.tmp
+
+# User credentials (NEVER commit credentials)
+*.json
+!assets/**/*.json
