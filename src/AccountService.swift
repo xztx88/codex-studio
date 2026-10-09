@@ -283,17 +283,30 @@ final class AccountService {
 
     // MARK: - Process Helpers (Accurate & Reliable)
 
+    private let chatgptBundleIdentifiers = ["com.openai.codex", "com.openai.chat"]
+
     func isChatGPTInstalled() -> Bool {
         if FileManager.default.fileExists(atPath: "/Applications/ChatGPT.app") {
             return true
         }
-        return NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.chat") != nil
+        for bid in chatgptBundleIdentifiers {
+            if NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) != nil {
+                return true
+            }
+        }
+        return false
     }
 
     func isChatGPTRunning() -> Bool {
+        for bid in chatgptBundleIdentifiers {
+            let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+            if apps.contains(where: { !$0.isTerminated }) {
+                return true
+            }
+        }
         let task = Process()
         task.launchPath = "/usr/bin/pgrep"
-        task.arguments = ["-f", "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"]
+        task.arguments = ["-f", "/Applications/ChatGPT.app"]
         let pipe = Pipe()
         task.standardOutput = pipe
         try? task.run()
@@ -303,41 +316,50 @@ final class AccountService {
 
     @discardableResult
     func quitChatGPT() -> Bool {
-        // 1. Tell application to quit gracefully
-        let script = "tell application \"ChatGPT\" to quit"
-        if let appleScript = NSAppleScript(source: script) {
-            var error: NSDictionary?
-            appleScript.executeAndReturnError(&error)
+        // 1. Terminate gracefully via macOS API
+        for bid in chatgptBundleIdentifiers {
+            let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bid)
+            for app in apps {
+                app.terminate()
+            }
         }
-        Thread.sleep(forTimeInterval: 0.25)
 
-        // 2. Force kill all child renderers, network helpers, and worker processes of ChatGPT app
+        // 2. Kill remaining child processes & helpers
         let task = Process()
         task.launchPath = "/usr/bin/pkill"
         task.arguments = ["-9", "-f", "/Applications/ChatGPT.app"]
         try? task.run()
         task.waitUntilExit()
 
-        // 3. Confirm all processes are terminated
-        for _ in 0..<20 {
+        // 3. Quick check for termination
+        for _ in 0..<5 {
             if !isChatGPTRunning() { break }
-            Thread.sleep(forTimeInterval: 0.1)
+            Thread.sleep(forTimeInterval: 0.03)
         }
         return true
     }
 
     @discardableResult
     func launchChatGPT() -> Bool {
+        for bid in chatgptBundleIdentifiers {
+            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid) {
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = true
+                NSWorkspace.shared.openApplication(at: appURL, configuration: config, completionHandler: nil)
+                return true
+            }
+        }
+        let appURL = URL(fileURLWithPath: "/Applications/ChatGPT.app")
+        if FileManager.default.fileExists(atPath: appURL.path) {
+            let config = NSWorkspace.OpenConfiguration()
+            config.activates = true
+            NSWorkspace.shared.openApplication(at: appURL, configuration: config, completionHandler: nil)
+            return true
+        }
         let task = Process()
         task.launchPath = "/usr/bin/open"
         task.arguments = ["-a", "/Applications/ChatGPT.app"]
         try? task.run()
-        task.waitUntilExit()
-
-        for _ in 0..<20 {
-            if isChatGPTRunning() { return true }
-            Thread.sleep(forTimeInterval: 0.1)
-        }
         return true
     }
 
@@ -468,23 +490,28 @@ final class AccountService {
     }
 
     func switchAccount(to target: AccountItem, autoRestartChatGPT: Bool) async throws {
-        if isChatGPTRunning() {
-            quitChatGPT()
-        }
-
-        // Refresh token from OpenAI
+        // 1. Prepare valid tokens (Skip remote HTTP network call if access token is still fresh!)
         var tokens: [String: Any]
-        do {
-            tokens = try await refreshTokens(refreshToken: target.refreshToken)
-        } catch {
-            if let access = target.accessToken, !access.isEmpty {
-                tokens = [
-                    "access_token": access,
-                    "id_token": target.idToken,
-                    "refresh_token": target.refreshToken
-                ]
-            } else {
-                throw error
+        if let access = target.accessToken, !isTokenExpired(token: access) {
+            tokens = [
+                "access_token": access,
+                "id_token": target.idToken,
+                "refresh_token": target.refreshToken
+            ]
+        } else {
+            // Only query OpenAI OAuth servers if expired or missing, done before quitting app
+            do {
+                tokens = try await refreshTokens(refreshToken: target.refreshToken)
+            } catch {
+                if let access = target.accessToken, !access.isEmpty {
+                    tokens = [
+                        "access_token": access,
+                        "id_token": target.idToken,
+                        "refresh_token": target.refreshToken
+                    ]
+                } else {
+                    throw error
+                }
             }
         }
 
@@ -498,7 +525,7 @@ final class AccountService {
         let accountId = claims.accountId ?? target.chatgptAccountId
         let email = claims.email ?? target.email
 
-        // Write to ~/.codex/auth.json
+        // 2. Write to ~/.codex/auth.json
         let isoFormatter = ISO8601DateFormatter()
         isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let nowString = isoFormatter.string(from: Date())
@@ -521,7 +548,7 @@ final class AccountService {
         try authJson.write(to: authURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authURL.path)
 
-        // Update local store
+        // 3. Update local store
         var (_, accounts) = try loadStore()
         for idx in 0..<accounts.count {
             if accounts[idx].email.lowercased() == email.lowercased() ||
@@ -538,8 +565,13 @@ final class AccountService {
 
         try writeStore(active: email, accounts: accounts)
 
+        // 4. Instantly relaunch ChatGPT if requested
         if autoRestartChatGPT && isChatGPTInstalled() {
-            try? await Task.sleep(nanoseconds: 600_000_000)
+            let wasRunning = isChatGPTRunning()
+            if wasRunning {
+                quitChatGPT()
+                try? await Task.sleep(nanoseconds: 60_000_000)
+            }
             launchChatGPT()
         }
     }
